@@ -1,0 +1,182 @@
+#!/bin/bash
+set -euo pipefail
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Running this requires both gh and jq to be installed.
+# Automatically synchronizes repository size/* and priority/* labels to custom fields on Project 120.
+
+EVENT_NAME=${1:-""}
+LABEL_NAME=${2:-""}
+ACTION=${3:-""}
+CONTENT_NODE_ID=${4:-""}
+
+if [[ -z "$LABEL_NAME" || -z "$CONTENT_NODE_ID" ]]; then
+  echo "Usage: $0 <event_name> <label_name> <action> <content_node_id>"
+  exit 1
+fi
+
+# We only care about size/ and priority/ labels
+if [[ "$LABEL_NAME" != "size/"* && "$LABEL_NAME" != "priority/"* ]]; then
+  echo "Label $LABEL_NAME is not a size or priority label. Skipping."
+  exit 0
+fi
+
+FIELD_PREFIX=""
+FIELD_NAME=""
+if [[ "$LABEL_NAME" == "size/"* ]]; then
+  FIELD_PREFIX="size/"
+  FIELD_NAME="Size"
+elif [[ "$LABEL_NAME" == "priority/"* ]]; then
+  FIELD_PREFIX="priority/"
+  FIELD_NAME="Priority"
+fi
+
+ORG_LOGIN="kubernetes-sigs"
+PROJECT_NUMBER=120
+
+# 1. Query Project 120 metadata and Issue/PR state/labels
+echo "Querying Project 120 metadata and Issue/PR active state..."
+GRAPHQL_JSON=$(gh api graphql -f orgLogin="$ORG_LOGIN" -F projectNumber="$PROJECT_NUMBER" -f nodeId="$CONTENT_NODE_ID" -f query='
+  query($orgLogin: String!, $projectNumber: Int!, $nodeId: ID!) {
+    organization(login: $orgLogin) {
+      projectV2(number: $projectNumber) {
+        id
+        fields(first: 20) {
+          nodes {
+            ... on ProjectV2SingleSelectField {
+              id
+              name
+              options { id name }
+            }
+          }
+        }
+      }
+    }
+    node(id: $nodeId) {
+      ... on Issue {
+        state
+        labels(first: 50) { nodes { name } }
+        projectItems(first: 10) { nodes { id project { id } } }
+      }
+      ... on PullRequest {
+        state
+        labels(first: 50) { nodes { name } }
+        projectItems(first: 10) { nodes { id project { id } } }
+      }
+    }
+  }
+')
+
+# Check State
+STATE=$(echo "$GRAPHQL_JSON" | jq -r '.data.node.state // "OPEN"')
+if [[ "$STATE" != "OPEN" ]]; then
+  echo "Issue/PR is in state: $STATE. Project board sync only applies to OPEN items. Skipping."
+  exit 0
+fi
+
+PROJECT_ID=$(echo "$GRAPHQL_JSON" | jq -r '.data.organization.projectV2.id')
+FIELD_JSON=$(echo "$GRAPHQL_JSON" | jq --arg fname "$FIELD_NAME" '.data.organization.projectV2.fields.nodes[] | select(.name == $fname)')
+if [[ -z "$FIELD_JSON" ]]; then
+  echo "Error: Field $FIELD_NAME not found in Project 120."
+  exit 1
+fi
+FIELD_ID=$(echo "$FIELD_JSON" | jq -r '.id')
+
+# Determine active label for this field prefix
+ACTIVE_LABEL=$(echo "$GRAPHQL_JSON" | jq -r --arg pfx "$FIELD_PREFIX" '.data.node.labels.nodes[]? | select(.name | startswith($pfx)) | .name' | head -n 1)
+
+EXPECTED_VALUE=""
+SHOULD_CLEAR=false
+
+if [[ -n "$ACTIVE_LABEL" ]]; then
+  if [[ "$FIELD_NAME" == "Size" ]]; then
+    SIZE_VAL=${ACTIVE_LABEL#size/}
+    case "$SIZE_VAL" in
+      XS) EXPECTED_VALUE="XS" ;;
+      S)  EXPECTED_VALUE="S" ;;
+      M)  EXPECTED_VALUE="M" ;;
+      L)  EXPECTED_VALUE="L" ;;
+      XL) EXPECTED_VALUE="XL" ;;
+      XXL) EXPECTED_VALUE="XXL" ;;
+      *)  EXPECTED_VALUE="" ;;
+    esac
+  elif [[ "$FIELD_NAME" == "Priority" ]]; then
+    PRIO_VAL=${ACTIVE_LABEL#priority/}
+    case "$PRIO_VAL" in
+      critical-urgent) EXPECTED_VALUE="P0" ;;
+      important-soon) EXPECTED_VALUE="P1" ;;
+      important-longterm) EXPECTED_VALUE="P2" ;;
+      backlog) EXPECTED_VALUE="P3" ;;
+      awaiting-more-evidence) EXPECTED_VALUE="P4" ;;
+      *) EXPECTED_VALUE="" ;;
+    esac
+  fi
+fi
+
+if [[ -z "$EXPECTED_VALUE" ]]; then
+  SHOULD_CLEAR=true
+fi
+
+OPTION_ID="null"
+if [[ "$SHOULD_CLEAR" == false ]]; then
+  OPTION_ID=$(echo "$FIELD_JSON" | jq -r --arg val "$EXPECTED_VALUE" '.options[] | select(.name == $val) | .id')
+  if [[ -z "$OPTION_ID" || "$OPTION_ID" == "null" ]]; then
+    echo "Error: Option $EXPECTED_VALUE not found in field $FIELD_NAME."
+    exit 1
+  fi
+fi
+
+echo "Target Field: $FIELD_NAME, Active Label: ${ACTIVE_LABEL:-none}, Target Value: $(if [[ "$SHOULD_CLEAR" == true ]]; then echo "(clear)"; else echo "$EXPECTED_VALUE"; fi)"
+
+# Lookup or Add Item to Project 120
+ITEM_ID=$(echo "$GRAPHQL_JSON" | jq -r --arg pid "$PROJECT_ID" '.data.node.projectItems.nodes[]? | select(.project.id == $pid) | .id')
+
+if [[ -z "$ITEM_ID" || "$ITEM_ID" == "null" ]]; then
+  echo "Item not found in Project 120. Adding item..."
+  ADD_JSON=$(gh api graphql -f projectId="$PROJECT_ID" -f contentId="$CONTENT_NODE_ID" -f query='
+    mutation($projectId: ID!, $contentId: ID!) {
+      addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+        item { id }
+      }
+    }
+  ')
+  ITEM_ID=$(echo "$ADD_JSON" | jq -r '.data.addProjectV2ItemById.item.id')
+  echo "Successfully added item to Project 120. Item ID: $ITEM_ID"
+else
+  echo "Item already exists in Project 120. Item ID: $ITEM_ID"
+fi
+
+# Mutate Field Value
+if [[ "$SHOULD_CLEAR" == true ]]; then
+  echo "Clearing field $FIELD_NAME for item $ITEM_ID..."
+  gh api graphql -f projectId="$PROJECT_ID" -f itemId="$ITEM_ID" -f fieldId="$FIELD_ID" -f query='
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!) {
+      clearProjectV2ItemFieldValue(input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId}) {
+        projectV2Item { id }
+      }
+    }
+  ' > /dev/null
+  echo "Successfully cleared field $FIELD_NAME."
+else
+  echo "Updating field $FIELD_NAME to $EXPECTED_VALUE for item $ITEM_ID..."
+  gh api graphql -f projectId="$PROJECT_ID" -f itemId="$ITEM_ID" -f fieldId="$FIELD_ID" -f value="$OPTION_ID" -f query='
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+      updateProjectV2ItemFieldValue(input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: {singleSelectOptionId: $value}}) {
+        projectV2Item { id }
+      }
+    }
+  ' > /dev/null
+  echo "Successfully updated field $FIELD_NAME to $EXPECTED_VALUE."
+fi
